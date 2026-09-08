@@ -28,8 +28,27 @@
 // triangles that actually carry a diffuse map fall through to the
 // general per-pixel loop. This means enabling TEXTURE_MAPPING globally
 // no longer penalises scenes that mostly draw flat-shaded geometry.
+//
+// PATCHED FOR arcade-os jet60: HALF_WIDTH_BUFFERS REMOVED FROM THIS GATE.
+// Nothing in the reasoning above involves the buffer being half width - the
+// path is unlocked by the ABSENCE of per-pixel machinery, which is a property
+// of the config, not of the stride. What WAS half-width-specific is the body:
+// it addressed y*(screenWidth/2) + xStart/2, stepped x by two, and evaluated
+// only the two Bayer phases a half-width walk visits. So a full-width build
+// fell through to the general per-pixel loop and paid the edge-accumulate and
+// the dither lookup on every pixel it drew.
+//
+// Measured on an ESP32-S3 at a true full 320x240: that cost Taxi Rush's city
+// ~35 ms of raster a frame against ~10 ms for the same scene at half width,
+// which is most of why docs/jet-sort-report.md calls half width "worth more
+// than half the pixels". Half of that gap was this missing path, not the
+// pixel count. A full-width body is written below; both are kept and selected
+// by HALF_WIDTH_BUFFERS, so existing half-width callers are untouched.
+// A depth test is per-pixel work, so it does belong in this gate - but only
+// the HALF-width body is unable to carry one. The full-width body below has
+// a depth-tested variant, so let it through there.
 #define JET_FAST_SIMPLE_SPANS                                             \
-    (HALF_WIDTH_BUFFERS && !Z_BUFFERING &&                                   \
+    ((!Z_BUFFERING || !HALF_WIDTH_BUFFERS) &&                                \
      !LIGHTING && !Z_BRIGHTNESS && !DEBUG_OVERDRAW &&                        \
      !RENDER_TILE_BUFFER && FAST_Z && !PERSPECTIVE_CORRECT_TEXTURES)
 
@@ -459,7 +478,13 @@ namespace Renderer
         // Per-object zBias pulls the surface toward the camera in real
         // depth units (no longer divided by 4) so a small bias really is
         // a small distance — 1 unit of bias = 1 unit of world depth.
-        int32_t zbRaw = z - zBias;
+        // PATCHED FOR arcade-os jet60: >> Z_DEPTH_SHIFT before the clamp. The
+        // comment above assumes a farPlane of ~4096; this city's is 80000
+        // internal units, so a raw narrowing would saturate everything past
+        // 65535 - about a fifth of the world - to one depth and z-fight it all.
+        // One shift buys 131070 of range at 2 units of resolution, which is
+        // 0.005 game units.
+        int32_t zbRaw = (z - zBias) >> 1;
         if (zbRaw < 0)     zbRaw = 0;
         if (zbRaw > 65535) zbRaw = 65535;
         uint16_t zb = (uint16_t)zbRaw;
@@ -1130,6 +1155,8 @@ namespace Renderer
             // per-pixel dither lookup (alpha is triangle-constant in this
             // config, so the mask reduces to two per-row booleans).
             (void)ew0; (void)ew1; (void)ew2;  // Unused in this path.
+#if HALF_WIDTH_BUFFERS
+            // ---- HALF-WIDTH BODY (unchanged) ----------------------------
 #if FIELD_BUFFERS
             int32_t bufferIndex = (y >> 1) * (screenWidth / 2) + (xStart / 2);
 #else
@@ -1217,6 +1244,118 @@ namespace Renderer
                 }
             }
 #endif // SCREEN_DOOR_ALPHA
+#else  // !HALF_WIDTH_BUFFERS
+            // ---- FULL-WIDTH BODY ----------------------------------------
+            // The same idea at stride 1. The scanline solver has already
+            // bounded x to [xStart, xEnd] inside the triangle, so nothing is
+            // left to decide per pixel except the dither phase - and that is a
+            // function of (x & 3) and (y & 3) alone. Where a half-width walk
+            // sees two of the four Bayer columns this sees all four, so the two
+            // booleans become four; the all-set and none-set cases still
+            // collapse to a span fill and a row skip, which is what essentially
+            // all opaque geometry hits.
+#if FIELD_BUFFERS
+            int32_t bufferIndex = (y >> 1) * screenWidth + xStart;
+#else
+            int32_t bufferIndex = y * screenWidth + xStart;
+#endif
+#if Z_BUFFERING
+            // ---- DEPTH-TESTED FULL-WIDTH SPAN ---------------------------
+            // FAST_Z gives ONE depth for the whole triangle, so there is no
+            // per-pixel interpolation here - just a load, a compare and a
+            // second store. That is several times a plain fill and still far
+            // less than the general per-pixel path, which would also be doing
+            // edge accumulation and a dither lookup on every pixel.
+            //
+            // At full width ZBUFFER_STRIDE is screenWidth, so the depth index
+            // is the colour index.
+            {
+                const bool zTest  = !ignoreZBuffer;
+                const bool zWrite = !noWriteZBuffer;
+#if SCREEN_DOOR_ALPHA
+                bool draw[4] = { true, true, true, true };
+                if (alpha <= 240) {
+                    constexpr uint8_t thresholdMatrix[16] = {
+                        15, 135, 45, 165,
+                        195, 75, 225, 105,
+                        60, 180, 30, 150,
+                        240, 120, 210, 90};
+                    const int yRow = (y & 3) << 2;
+                    for (int q = 0; q < 4; ++q) draw[q] = alpha >= thresholdMatrix[q | yRow];
+                    if (!(draw[0] || draw[1] || draw[2] || draw[3])) continue;
+                }
+                for (int x = xStart; x <= xEnd; ++x, ++bufferIndex) {
+                    if (!draw[x & 3]) continue;
+                    if (zTest && zb > zBuffer[bufferIndex]) continue;
+                    if (zWrite) zBuffer[bufferIndex] = zb;
+                    framebuffer[bufferIndex] = color;
+                }
+#else
+                for (int x = xStart; x <= xEnd; ++x, ++bufferIndex) {
+                    if (zTest && zb > zBuffer[bufferIndex]) continue;
+                    if (zWrite) zBuffer[bufferIndex] = zb;
+                    framebuffer[bufferIndex] = plainOpaqueReplace
+                        ? color
+                        : blendRGB565(framebuffer[bufferIndex], color, alpha);
+                }
+#endif
+            }
+#elif SCREEN_DOOR_ALPHA
+            if (alpha > 240) {
+                fillRGB565Span(framebuffer, bufferIndex, xEnd - xStart + 1, color);
+            } else {
+                // Same 4x4 Bayer matrix as shouldDrawPixel, all four columns.
+                constexpr uint8_t thresholdMatrix[16] = {
+                    15, 135, 45, 165,
+                    195, 75, 225, 105,
+                    60, 180, 30, 150,
+                    240, 120, 210, 90};
+                const int yRow = (y & 3) << 2;
+                const bool d0 = alpha >= thresholdMatrix[0 | yRow];
+                const bool d1 = alpha >= thresholdMatrix[1 | yRow];
+                const bool d2 = alpha >= thresholdMatrix[2 | yRow];
+                const bool d3 = alpha >= thresholdMatrix[3 | yRow];
+                if (!(d0 || d1 || d2 || d3)) continue;   // whole row dithered out
+                if (d0 && d1 && d2 && d3) {
+                    fillRGB565Span(framebuffer, bufferIndex, xEnd - xStart + 1, color);
+                } else {
+                    const bool draw[4] = { d0, d1, d2, d3 };
+                    for (int x = xStart; x <= xEnd; ++x, ++bufferIndex)
+                        if (draw[x & 3]) framebuffer[bufferIndex] = color;
+                }
+            }
+#else  // !SCREEN_DOOR_ALPHA
+            if (plainOpaqueReplace) {
+                fillRGB565Span(framebuffer, bufferIndex, xEnd - xStart + 1, color);
+            } else if (isWaterReflect) {
+                const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
+                int32_t mirrorIdx = waterMirrorBufBase + xStart;
+                const uint16_t skyCol = waterSkyFallback ? gradientColors[0] : 0;
+                for (int x = xStart; x <= xEnd; ++x, ++bufferIndex, ++mirrorIdx) {
+                    const uint16_t reflPx = waterSkyFallback ? skyCol : srcBuf[mirrorIdx];
+                    framebuffer[bufferIndex] = blendRGB565(material->color,
+                                                           reflPx,
+                                                           waterReflectAlpha);
+                }
+            } else if (isAdditive) {
+                if (alpha == 255) {
+                    for (int x = xStart; x <= xEnd; ++x, ++bufferIndex) {
+                        const uint16_t d = framebuffer[bufferIndex];
+                        uint32_t r = ((d >> 11) & 0x1Fu) + ((color >> 11) & 0x1Fu); if (r > 0x1Fu) r = 0x1Fu;
+                        uint32_t g = ((d >>  5) & 0x3Fu) + ((color >>  5) & 0x3Fu); if (g > 0x3Fu) g = 0x3Fu;
+                        uint32_t b = ( d        & 0x1Fu) + ( color        & 0x1Fu); if (b > 0x1Fu) b = 0x1Fu;
+                        framebuffer[bufferIndex] = (uint16_t)((r << 11) | (g << 5) | b);
+                    }
+                } else {
+                    for (int x = xStart; x <= xEnd; ++x, ++bufferIndex)
+                        framebuffer[bufferIndex] = addBlendRGB565(framebuffer[bufferIndex], color, alpha);
+                }
+            } else {
+                for (int x = xStart; x <= xEnd; ++x, ++bufferIndex)
+                    framebuffer[bufferIndex] = blendRGB565(framebuffer[bufferIndex], color, alpha);
+            }
+#endif // SCREEN_DOOR_ALPHA
+#endif // HALF_WIDTH_BUFFERS
             }  // close fast simple-span block
 #if TEXTURE_MAPPING
             else

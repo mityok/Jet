@@ -57,6 +57,18 @@ struct RenderVertex {
 /// directly.
 class Rasterizer
 {
+    public:
+        /// @brief PATCHED FOR arcade-os jet60: repoint the depth buffer.
+        ///
+        /// A band is rasterised over disjoint rows, so depth only has to cover
+        /// the band being drawn - 48 rows is 30720 bytes, against 153600 for a
+        /// full screen. Two of those fit in internal SRAM where one full-screen
+        /// buffer does not, which is the difference between depth in DRAM and
+        /// depth in PSRAM. The caller passes a VIRTUAL BASE, band - y0*stride,
+        /// so absolute y still indexes correctly; the same trick Scene.hpp
+        /// documents for the framebuffer.
+        void setZBuffer(uint16_t* z) { zBuffer = z; }
+
     private:
         uint16_t *framebuffer;
         int screenWidth;

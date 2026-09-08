@@ -2,6 +2,55 @@
   <img src="Logo.png" alt="Jet logo" width="512px">
 </p>
 
+> ## This is a MODIFIED fork of Jet
+>
+> Modified 2026-09-08 by mityok, on the `arcade-os` branch, from upstream
+> [CubeCoders/Jet](https://github.com/CubeCoders/Jet) at `4db6aa1`. This notice
+> is required by the AGPL-3.0 that Jet is licensed under (section 5a); the
+> licence itself is unchanged and applies to these modifications too.
+>
+> It exists to serve two games on one ESP32-S3 handheld - Taxi Rush and Ion
+> Drift, in the `arcade-os` console - which needed changes too large to keep
+> applying as post-install patch scripts to a downloaded copy. Everything here
+> was measured on that device.
+>
+> **What is different from upstream** (all marked in-source):
+>
+> - **`ObjectSortTree`** (`Scene.hpp` / `Scene.cpp`) - an object-level BSP for
+>   painter ordering, built once over static geometry. The bucket sort orders
+>   objects by a single depth key, which cannot describe a large object: a
+>   pillar in front of a facade sorted behind it, and no choice of key fixes
+>   that. The tree stores the separating planes instead. It also culls: the
+>   node bounding boxes reject whole subtrees, 80% of objects against 68% for
+>   the per-object frustum test.
+> - **A full-width fast-span loop** (`Renderer.cpp`) - the existing fast path was
+>   gated on `HALF_WIDTH_BUFFERS`; the gate now excludes it, so a full-width
+>   build gets the same paired 32-bit fill.
+> - **A per-call depth base for `rasterizeBand()`** (`Scene.cpp`) - pass a
+>   virtual base of `band - yMin*stride` and absolute `y` indexes a band-sized
+>   allocation, so depth need not be full-screen. The same trick lets the
+>   colour buffer be one band, which is what makes 320x240 fit in 30,720 bytes
+>   of internal SRAM instead of 153,600.
+> - **A 4-byte per-band triangle reject** (`Scene.cpp`) - `rasterizeBand()` walked
+>   the whole queue for every band and loaded a ~100-byte record to discover the
+>   triangle was elsewhere. A packed y-span read first makes the reject cheap.
+> - **`Object::sortOwnTriangles`** - opt out of the per-frame sort of a mesh's own
+>   triangles. A convex solid under backface culling does not need it; it was
+>   7 ms of a 20.5 ms `prepareFrame()`.
+> - **`Object::sortDynamic`** - exclude a moving object from the sort tree, which
+>   is built from world bounding boxes and would otherwise order it from where
+>   it stood at boot.
+> - **`JET_PROFILE_PREP`** - split `prepareFrame()` into clear / transform / sort,
+>   two `micros()` calls a frame. It is what showed a ~5.5 ms floor with no
+>   geometry in it, which turned out to be the per-object cull paging 488 object
+>   headers in from PSRAM.
+> - **A 16-byte alignment guard** in the `EE.VST.128.XP` clear (`Scene.cpp`) - the
+>   instruction ignores the low 4 address bits, so a merely 4-byte-aligned
+>   framebuffer had row 0's first store land BEFORE the buffer and corrupt the
+>   neighbouring heap block.
+>
+> Upstream is not responsible for any of it. Bugs here are ours.
+
 # Jet
 
 **Jet** is a tiny, dependency-free, fixed-function 3D rasteriser written in

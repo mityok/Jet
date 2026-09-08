@@ -6,6 +6,35 @@
 #include <algorithm> // For std::min, std::max
 #include <cmath> // For sqrtf (per-object distance fade / LOD pick)
 
+// PATCHED IN THE INSTALLED COPY (ion-drift tools/patch_jet_profile.py).
+//
+// prepareFrame() phase timing. Compiles to nothing at all unless the build
+// defines JET_PROFILE_PREP, so an un-instrumented build pays neither the calls
+// nor the three stores.
+//
+// micros() on Arduino rather than <chrono>: it is what the ESP32 frame-budget
+// harness measures whole frames with, and mixing two clocks in one report is
+// how a rounding difference becomes an argument. Both are unsigned 32-bit
+// microseconds, so a delta stays correct across the ~71 minute wrap.
+#if JET_PROFILE_PREP
+  #ifdef ARDUINO
+    #include <Arduino.h>
+    static inline uint32_t jetPrepNowUs() { return (uint32_t)micros(); }
+  #else
+    #include <chrono>
+    static inline uint32_t jetPrepNowUs() {
+        return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+  #endif
+  #define JET_PREP_CLOCK(v)      uint32_t v = jetPrepNowUs()
+  #define JET_PREP_SPLIT(f, v)   do { const uint32_t n_ = jetPrepNowUs(); \
+                                      (f) = n_ - (v); (v) = n_; } while (0)
+#else
+  #define JET_PREP_CLOCK(v)      ((void)0)
+  #define JET_PREP_SPLIT(f, v)   ((void)0)
+#endif
+
 namespace Renderer {
 
 // Static emissive material used to render triangles whose lighting has been
@@ -90,9 +119,21 @@ bool Scene::cullObject(Object* obj,
     // the sphere's z sign — no divides, no per-object sqrt (plane normal
     // lengths cullPlaneLh/Lv are cached per frame in prepareFrame()).
     {
-        const float r = (float)std::max({bMax.x - bMin.x,
-                                         bMax.y - bMin.y,
-                                         bMax.z - bMin.z});
+        // PATCHED FOR arcade-os jet60. This was the longest FULL extent of the
+        // AABB, where the true bounding sphere is HALF THE DIAGONAL - 1.9x the
+        // radius and ~7x the volume for the 8 x 42 x 8 towers this city is made
+        // of. The comment it replaced justified the slack as cover for rotated
+        // meshes, but a sphere is rotation invariant: rotating a mesh inside its
+        // AABB cannot move a vertex outside the sphere centred on that AABB with
+        // half-diagonal radius. An over-large sphere costs admissions - objects
+        // that take neither cheap exit get fully transformed and then thrown
+        // away - and prep is what sets the frame here. See finding 4 in
+        // taxi-3d/docs/jet-sort-report.md, where the rendered frame came out
+        // byte-identical with 87 objects admitted instead of 80.
+        const float ex = (float)(bMax.x - bMin.x);
+        const float ey = (float)(bMax.y - bMin.y);
+        const float ez = (float)(bMax.z - bMin.z);
+        const float r  = 0.5f * sqrtf(ex * ex + ey * ey + ez * ez);
         constexpr float invFps = 1.0f / (float)FIXED_POINT_SCALE;
         const float cYc = (float)camCosY * invFps, cYs = (float)camSinY * invFps;
         const float cXc = (float)camCosX * invFps, cXs = (float)camSinX * invFps;
@@ -306,6 +347,11 @@ void Scene::reconstructCheckerboard() {
 // per instruction). dest must be 16-byte aligned; n32 need not be a
 // multiple of 4 — trailing elements are handled with scalar stores.
 static void jet_fill_u32x16(uint32_t* dest, uint32_t val, int n32) {
+    // PATCHED IN THE VENDORED COPY (ion-drift tools/sync_to_arcade.ps1).
+    // EE.VST.128.XP ignores the low 4 address bits. Without this, a framebuffer
+    // that is merely 4-byte aligned - which arcade-os's is - has row 0's first
+    // store land BEFORE the buffer and corrupt the neighbouring heap block.
+    while (n32 > 0 && (((uintptr_t)dest) & 0xF)) { *dest++ = val; --n32; }
     const int n16 = n32 >> 2;
     if (n16 > 0) {
         __asm__ volatile (
@@ -489,8 +535,345 @@ void PERF_CRITICAL Scene::clearBuffers() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ObjectSortTree - PATCHED FOR arcade-os jet60. See Scene.hpp for why this
+// exists at all; what follows is only how it is built and how it is walked.
+// ---------------------------------------------------------------------------
+
+// World-space AABB of an object. Conservative is enough for correctness: a box
+// that is too big can only cost a clean split, never produce a wrong one.
+static void jetWorldBox(const Object* o, int32_t mn[3], int32_t mx[3]) {
+    int32_t lo[3] = { o->boundingBoxMin.x, o->boundingBoxMin.y, o->boundingBoxMin.z };
+    int32_t hi[3] = { o->boundingBoxMax.x, o->boundingBoxMax.y, o->boundingBoxMax.z };
+    // A rotated object's local box is not its world box. Every static object in
+    // the city is authored axis-aligned (rotations are baked at build time), so
+    // rather than transform eight corners per object, fall back to the
+    // rotation-invariant cube that contains the mesh whatever its angle.
+    if (o->rotation.x != 0 || o->rotation.y != 0 || o->rotation.z != 0) {
+        int32_t r = 0;
+        for (int a = 0; a < 3; ++a) {
+            const int32_t la = lo[a] < 0 ? -lo[a] : lo[a];
+            const int32_t ha = hi[a] < 0 ? -hi[a] : hi[a];
+            if (la > r) r = la;
+            if (ha > r) r = ha;
+        }
+        lo[0] = lo[1] = lo[2] = -r;
+        hi[0] = hi[1] = hi[2] =  r;
+    }
+    const int32_t pos[3] = { o->position.x, o->position.y, o->position.z };
+    for (int a = 0; a < 3; ++a) { mn[a] = pos[a] + lo[a]; mx[a] = pos[a] + hi[a]; }
+}
+
+bool ObjectSortTree::build(const std::vector<Object*>& objs, int leafMax, int32_t slack) {
+    nodes.clear(); items.clear(); dynamics.clear(); dynNode.clear();
+    leaves_ = 0; worstLeaf_ = 0; unsplit_ = 0;
+    src = &objs;
+    if (leafMax < 1) leafMax = 1;
+
+    std::vector<Box> boxes;
+    boxes.reserve(objs.size());
+    for (size_t i = 0; i < objs.size(); ++i) {
+        Object* o = objs[i];
+        if (!o) continue;
+        if (o->sortDynamic) { dynamics.push_back((int32_t)i); continue; }
+        Box b;
+        b.idx = (int32_t)i;
+        jetWorldBox(o, b.mn, b.mx);
+        boxes.push_back(b);
+    }
+    if (boxes.empty()) return false;
+
+    items.resize(boxes.size());
+    dynNode.assign(dynamics.size(), -1);
+    nodes.reserve(boxes.size() * 2);
+    if (slack < 0) slack = 0;
+    buildRec(boxes, 0, (int)boxes.size(), leafMax, slack, 0);
+    return true;
+}
+
+void ObjectSortTree::preferPlane(uint8_t axis, int32_t value) {
+    if (axis > 2) return;
+    Plane p;
+    p.axis  = axis;
+    p.value = value;
+    preferred.push_back(p);
+}
+
+void ObjectSortTree::clearPreferredPlanes() { preferred.clear(); }
+
+int32_t ObjectSortTree::buildRec(std::vector<Box>& v, int lo, int hi,
+                                 int leafMax, int32_t slack, int depth) {
+    const int n = hi - lo;
+    int     bestAxis  = -1;
+    int32_t bestValue = 0;
+    int     bestScore = INT32_MAX;
+
+    // CANDIDATE PLANES ARE THE OBJECTS' OWN MAX FACES, and that is not a
+    // heuristic. For any clean split the legal planes form the interval
+    // [largest left-hand max, smallest right-hand min], and the low end of
+    // that interval IS some object's max face - so every split a plane could
+    // possibly make is already reachable from this candidate set. Testing min
+    // faces as well would double the work and find nothing new.
+    //
+    // The straddle test bails on the first object that crosses the plane,
+    // which is what keeps this affordable: most candidates die immediately and
+    // only a genuinely clean one pays for the full scan.
+    if (n > leafMax && depth < 62) {
+        // A caller's plane first. It is not a heuristic and not a shortcut: any
+        // clean plane is correct, so this only decides WHICH correct order the
+        // tree produces, and the caller knows things about its own world that
+        // a balance score cannot see. See preferPlane() in Scene.hpp.
+        for (size_t pi = 0; pi < preferred.size() && bestAxis < 0; ++pi) {
+            const int     a   = preferred[pi].axis;
+            const int32_t val = preferred[pi].value;
+            int  left = 0, right = 0;
+            bool clean = true;
+            for (int j = lo; j < hi; ++j) {
+                if (v[j].mx[a] <= val + slack)      ++left;
+                else if (v[j].mn[a] >= val - slack) ++right;
+                else { clean = false; break; }
+            }
+            if (clean && left > 0 && right > 0) { bestAxis = a; bestValue = val; }
+        }
+        for (int a = 0; a < 3 && bestAxis < 0; ++a) {
+            for (int i = lo; i < hi; ++i) {
+                const int32_t val = v[i].mx[a];
+                int  left = 0, right = 0;
+                bool clean = true;
+                for (int j = lo; j < hi; ++j) {
+                    if (v[j].mx[a] <= val + slack)      ++left;
+                    else if (v[j].mn[a] >= val - slack) ++right;
+                    else { clean = false; break; }
+                }
+                if (!clean || left == 0 || right == 0) continue;
+                const int score = (left > right) ? (left - right) : (right - left);
+                if (score < bestScore) { bestScore = score; bestAxis = a; bestValue = val; }
+            }
+        }
+    }
+
+    const int32_t self = (int32_t)nodes.size();
+    nodes.push_back(Node());
+
+    if (bestAxis < 0) {
+        // No clean plane, or small enough already: a leaf, ordered later by
+        // the caller's depth key.
+        for (int k = lo; k < hi; ++k) items[k] = v[k].idx;
+        Node& nd = nodes[self];
+        nd.axis = 3; nd.value = 0; nd.a = lo; nd.b = n;
+        for (int ax = 0; ax < 3; ++ax) { nd.mn[ax] = INT32_MAX; nd.mx[ax] = INT32_MIN; }
+        for (int k = lo; k < hi; ++k)
+            for (int ax = 0; ax < 3; ++ax) {
+                if (v[k].mn[ax] < nd.mn[ax]) nd.mn[ax] = v[k].mn[ax];
+                if (v[k].mx[ax] > nd.mx[ax]) nd.mx[ax] = v[k].mx[ax];
+            }
+        ++leaves_;
+        if (n > worstLeaf_) worstLeaf_ = n;
+        if (n > leafMax)    ++unsplit_;
+        return self;
+    }
+
+    int mid = lo;
+    for (int i = lo; i < hi; ++i)
+        if (v[i].mx[bestAxis] <= bestValue + slack) { std::swap(v[i], v[mid]); ++mid; }
+
+    const int32_t minusChild = buildRec(v, lo,  mid, leafMax, slack, depth + 1);
+    const int32_t plusChild  = buildRec(v, mid, hi,  leafMax, slack, depth + 1);
+    Node& nd = nodes[self];   // taken after the recursion: push_back may have moved it
+    nd.axis  = (uint8_t)bestAxis;
+    nd.value = bestValue;
+    nd.a     = minusChild;
+    nd.b     = plusChild;
+    for (int ax = 0; ax < 3; ++ax) {
+        nd.mn[ax] = nodes[minusChild].mn[ax] < nodes[plusChild].mn[ax]
+                  ? nodes[minusChild].mn[ax] : nodes[plusChild].mn[ax];
+        nd.mx[ax] = nodes[minusChild].mx[ax] > nodes[plusChild].mx[ax]
+                  ? nodes[minusChild].mx[ax] : nodes[plusChild].mx[ax];
+    }
+    return self;
+}
+
+int32_t ObjectSortTree::leafFor(int32_t x, int32_t y, int32_t z) const {
+    if (nodes.empty()) return -1;
+    const int32_t q[3] = { x, y, z };
+    int32_t ni = 0;
+    for (int guard = 0; guard < 64; ++guard) {
+        const Node& nd = nodes[ni];
+        if (nd.axis == 3) return ni;
+        ni = (q[nd.axis] >= nd.value) ? nd.b : nd.a;
+    }
+    return ni;
+}
+
+void ObjectSortTree::order(int32_t camX, int32_t camY, int32_t camZ,
+                           std::vector<int32_t>& outOrder,
+                           std::vector<int32_t>& outGroups,
+                           BoxRejectFn reject, void* rejectCtx) {
+    outOrder.clear();
+    outGroups.clear();
+    if (nodes.empty()) return;
+
+    // A MOVER IS PLACED BY ITS CENTRE, not by its box. A point descends to
+    // exactly one leaf, so there is no straddle case to invent a rule for, and
+    // the object is then ordered against that leaf's few neighbours by the
+    // same depth fallback everything else in the leaf uses. Emitting it after
+    // the leaf's static objects, in a group of its own, is what ACTOR_BIAS used to
+    // buy: a car standing on a road chunk draws on top of the road it stands
+    // on, while the tree still orders it against every other leaf.
+    if (src) {
+        dynNode.resize(dynamics.size());
+        for (size_t d = 0; d < dynamics.size(); ++d) {
+            const Object* o = (*src)[dynamics[d]];
+            dynNode[d] = leafFor(o->position.x + o->centreVolume.x,
+                                 o->position.y + o->centreVolume.y,
+                                 o->position.z + o->centreVolume.z);
+        }
+    }
+
+    // A mover whose leaf never got visited still has to be drawn: the leaf was
+    // dismissed on the box of the STATIC things in it, which says nothing about
+    // where the car is now. Track what got emitted and sweep up at the end.
+    dynDone.assign(dynamics.size(), 0);
+
+    const int32_t cam[3] = { camX, camY, camZ };
+    // Explicit stack, not recursion: this runs on a worker task with a small
+    // stack. buildRec caps depth at 62, so 72 slots cannot overflow.
+    int32_t stack[72];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        const int32_t ni = stack[--sp];
+        const Node&   nd = nodes[ni];
+        // WHOLE SUBTREE OUT OF VIEW. One test against a box in internal SRAM
+        // stands in for a per-object cull that would have had to page every
+        // one of those objects in from PSRAM.
+        if (reject && reject(rejectCtx, nd.mn, nd.mx)) continue;
+        if (nd.axis == 3) {
+            outGroups.push_back((int32_t)outOrder.size());
+            for (int k = 0; k < nd.b; ++k) outOrder.push_back(items[nd.a + k]);
+            // Each mover gets a GROUP OF ITS OWN, immediately after the leaf
+            // it is standing in. The caller depth-sorts inside a group, so
+            // sharing the leaf's group would just hand the car back to the
+            // key that kept losing it; its own group makes "after the scenery
+            // it stands on" structural. The blast radius is one leaf - at most
+            // a handful of neighbours - where ACTOR_BIAS applied city-wide.
+            for (size_t d = 0; d < dynNode.size(); ++d)
+                if (dynNode[d] == ni) {
+                    outGroups.push_back((int32_t)outOrder.size());
+                    outOrder.push_back(dynamics[d]);
+                    dynDone[d] = 1;
+                }
+            continue;
+        }
+        // Camera on the plus side: every ray from it crosses the plane at most
+        // once, so all plus-side hits precede all minus-side ones and the minus
+        // subtree is drawn first. Push the near child first so the far one pops.
+        const bool    camPlus    = cam[nd.axis] >= nd.value;
+        const int32_t drawFirst  = camPlus ? nd.a : nd.b;
+        const int32_t drawSecond = camPlus ? nd.b : nd.a;
+        if (sp + 2 <= (int)(sizeof(stack) / sizeof(stack[0]))) {
+            stack[sp++] = drawSecond;
+            stack[sp++] = drawFirst;
+        }
+    }
+    // The sweep-up. Last is the only safe place for an object whose
+    // neighbourhood was culled - and there is nothing left there to fight.
+    for (size_t d = 0; d < dynDone.size(); ++d)
+        if (!dynDone[d]) {
+            outGroups.push_back((int32_t)outOrder.size());
+            outOrder.push_back(dynamics[d]);
+        }
+    outGroups.push_back((int32_t)outOrder.size());
+}
+
+size_t ObjectSortTree::byteSize() const {
+    return nodes.capacity()    * sizeof(Node)
+         + items.capacity()    * sizeof(int32_t)
+         + dynamics.capacity() * sizeof(int32_t)
+         + dynNode.capacity()  * sizeof(int32_t)
+         + dynDone.capacity()  * sizeof(uint8_t);
+}
+
+// PATCHED FOR arcade-os jet60. Was inline in renderObject(); see Scene.hpp for
+// the measurement that moved it. Composed camera rotation Rz * Rx * Ry, since
+// the original per-vertex code applied Y then X then Z.
+void Scene::updateCameraMatrix(int32_t camCosX, int32_t camSinX,
+                               int32_t camCosY, int32_t camSinY,
+                               int32_t camCosZ, int32_t camSinZ) {
+    const int32_t cx = camCosX, sx = camSinX;
+    const int32_t cy = camCosY, sy = camSinY;
+    const int32_t cz = camCosZ, sz = camSinZ;
+    // K = Rx * Ry
+    const int32_t k00 = cy;
+    const int32_t k01 = 0;
+    const int32_t k02 = sy;
+    const int32_t k10 = (int32_t)((int64_t)sx * sy / FIXED_POINT_SCALE);
+    const int32_t k11 = cx;
+    const int32_t k12 = (int32_t)(-(int64_t)sx * cy / FIXED_POINT_SCALE);
+    const int32_t k20 = (int32_t)(-(int64_t)cx * sy / FIXED_POINT_SCALE);
+    const int32_t k21 = sx;
+    const int32_t k22 = (int32_t)((int64_t)cx * cy / FIXED_POINT_SCALE);
+    // M = Rz * K
+    const int32_t m00 = (int32_t)(((int64_t)cz * k00 - (int64_t)sz * k10) / FIXED_POINT_SCALE);
+    const int32_t m01 = (int32_t)(((int64_t)cz * k01 - (int64_t)sz * k11) / FIXED_POINT_SCALE);
+    const int32_t m02 = (int32_t)(((int64_t)cz * k02 - (int64_t)sz * k12) / FIXED_POINT_SCALE);
+    const int32_t m10 = (int32_t)(((int64_t)sz * k00 + (int64_t)cz * k10) / FIXED_POINT_SCALE);
+    const int32_t m11 = (int32_t)(((int64_t)sz * k01 + (int64_t)cz * k11) / FIXED_POINT_SCALE);
+    const int32_t m12 = (int32_t)(((int64_t)sz * k02 + (int64_t)cz * k12) / FIXED_POINT_SCALE);
+    constexpr float inv = 1.0f / (float)FIXED_POINT_SCALE;
+    fCamM00 = (float)m00 * inv; fCamM01 = (float)m01 * inv; fCamM02 = (float)m02 * inv;
+    fCamM10 = (float)m10 * inv; fCamM11 = (float)m11 * inv; fCamM12 = (float)m12 * inv;
+    fCamM20 = (float)k20 * inv; fCamM21 = (float)k21 * inv; fCamM22 = (float)k22 * inv;
+}
+
+// Whole-subtree frustum reject for ObjectSortTree::order(). This is the same
+// conservative sphere-vs-frustum classification cullObject() opens with, over
+// the box around a subtree instead of around one mesh - so a node is dismissed
+// on exactly the evidence that would have dismissed every object in it, and
+// never on less.
+//
+// It reads nothing but this struct, which is a few dozen bytes of stack. That
+// is the entire point: the per-object cull it replaces has to touch position,
+// centreVolume and both bounding-box corners of every object, and on this
+// console the objects live in PSRAM.
+struct JetSubtreeCull {
+    float   camX, camY, camZ;
+    float   cYc, cYs, cXc, cXs, cZc, cZs;
+    float   fovFactor, hw, hh, planeLh, planeLv;
+    float   nearPlane, farPlane;
+};
+
+static bool jetSubtreeReject(void* ctx, const int32_t mn[3], const int32_t mx[3]) {
+    const JetSubtreeCull& c = *(const JetSubtreeCull*)ctx;
+    const float ex = (float)(mx[0] - mn[0]);
+    const float ey = (float)(mx[1] - mn[1]);
+    const float ez = (float)(mx[2] - mn[2]);
+    const float r  = 0.5f * sqrtf(ex * ex + ey * ey + ez * ez);
+    const float px = (float)(mx[0] + mn[0]) * 0.5f - c.camX;
+    const float py = (float)(mx[1] + mn[1]) * 0.5f - c.camY;
+    const float pz = (float)(mx[2] + mn[2]) * 0.5f - c.camZ;
+    // Camera rotation Y, X, Z - the same order cullObject uses.
+    const float t1x =  px * c.cYc + pz * c.cYs;
+    const float t1z = -px * c.cYs + pz * c.cYc;
+    const float t2y =  py * c.cXc - t1z * c.cXs;
+    const float t2z =  py * c.cXs + t1z * c.cXc;
+    const float cxv =  t1x * c.cZc - t2y * c.cZs;
+    const float cyv =  t1x * c.cZs + t2y * c.cZc;
+    const float czv =  t2z;
+    if (czv + r < c.nearPlane) return true;
+    if (czv - r > c.farPlane)  return true;
+    const float rLh = r * c.planeLh, rLv = r * c.planeLv;
+    const float dR =  cxv * c.fovFactor - czv * c.hw;
+    const float dL = -cxv * c.fovFactor - czv * c.hw;
+    const float dT =  cyv * c.fovFactor - czv * c.hh;
+    const float dB = -cyv * c.fovFactor - czv * c.hh;
+    return (dR > rLh || dL > rLh || dT > rLv || dB > rLv);
+}
+
 void Scene::prepareFrame() {
     if (!camera) return;
+
+    JET_PREP_CLOCK(prepT);
     // renderEvenLines drives the frame-parity selection used by both interlaced
     // and checkerboard modes.  In interlaced mode it selects which rows to draw;
     // in checkerboard mode it selects which (x+y) pixel parity to draw.  When
@@ -501,6 +884,7 @@ void Scene::prepareFrame() {
                       ? (frameCounter % 2 == 0)
                       : false;
     clearBuffers();
+    JET_PREP_SPLIT(lastFramePrepClearUs, prepT);
 
 #if MAX_PICK_QUERIES > 0
     // Reset pick results for this frame and hand the arrays to the
@@ -545,6 +929,7 @@ void Scene::prepareFrame() {
 
     int32_t camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ;
     camera->getRotationMatrix(camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ);
+    updateCameraMatrix(camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ);
 
     // Frustum side-plane normal lengths for cullObject's quick sphere
     // test. fovFactor changes at runtime (boost FOV kick) so refresh per
@@ -565,11 +950,25 @@ void Scene::prepareFrame() {
     renderer->waterlineY = screenHeight / 2
                          + (int)(camSinX * camera->fovFactor / 1024.0f);
 
+    lastFrameTransformedVertices = 0;
+    lastFramePrepObjectUs = 0;
     renderQueue.clear();
+    triYSpan.clear();          // patched: parallel to renderQueue, see Scene.hpp
     int drawnObjs = 0;
+    // PATCHED FOR arcade-os jet60: does anything in this frame use the two
+    // out-of-band draw orders? The tree orders the NORMAL band and nothing
+    // else, so a skybox (noWriteZBuffer) or an overlay (ignoreZBuffer) sends
+    // the whole frame back to the bucket sort, which knows how to keep them
+    // first and last. Taxi Rush uses neither; this is here so a scene that
+    // does cannot silently lose them.
+    bool sawBands = false;
 
-    for (auto obj : objects) {
-        if (!obj->enabled) continue;
+    // PATCHED FOR arcade-os jet60: THE PER-OBJECT BODY IS A LAMBDA so it can
+    // be driven two ways - straight down the object list as before, or in the
+    // leaf order the sort tree produces. Nothing inside it changed except
+    // `continue` becoming `return`, which is the same statement in a lambda.
+    auto drawOne = [&](Object* obj) {
+        if (!obj->enabled) return;
         // 1) Quick sphere far-cull before the expensive 8-corner AABB test.
         //    distSq to the object centre is computed unconditionally so it
         //    is also available for the fade ramps and LOD pick below,
@@ -589,11 +988,11 @@ void Scene::prepareFrame() {
                 obj->boundingBoxMax.y - obj->boundingBoxMin.y,
                 obj->boundingBoxMax.z - obj->boundingBoxMin.z});
             const int64_t farCutoff = static_cast<int64_t>(camera->farPlane) + maxExtent;
-            if (distSq > farCutoff * farCutoff) continue;
+            if (distSq > farCutoff * farCutoff) return;
         }
         // 2) Object-level AABB frustum cull (all 8 corners; full rotation).
         if (cullObject(obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ))
-            continue;
+            return;
         // 3) Per-object distance fade (two ramps, multiplied):
         //     - fadeFar > 0:   close=opaque, far=invisible (decor fade-out).
         //     - appearFar > 0: close=invisible, far=opaque (LOD impostor
@@ -610,7 +1009,7 @@ void Scene::prepareFrame() {
         if (obj->fadeFar > 0 || obj->appearFar > 0) {
             if (obj->fadeFar > 0) {
                 const int64_t farSq = (int64_t)obj->fadeFar * obj->fadeFar;
-                if (distSq >= farSq) continue; // fully past fade-out — skip
+                if (distSq >= farSq) return; // fully past fade-out — skip
                 const int64_t nearSq = (int64_t)obj->fadeNear * obj->fadeNear;
                 if (distSq > nearSq && obj->fadeFar > obj->fadeNear) {
                     if (dist < 0) dist = (int32_t)sqrtf((float)distSq);
@@ -626,7 +1025,7 @@ void Scene::prepareFrame() {
             // Appear-in ramp (LOD impostor).
             if (obj->appearFar > 0) {
                 const int64_t nearSq = (int64_t)obj->appearNear * obj->appearNear;
-                if (distSq <= nearSq) continue; // still too close — skip
+                if (distSq <= nearSq) return; // still too close — skip
                 const int64_t farSq = (int64_t)obj->appearFar * obj->appearFar;
                 if (distSq < farSq && obj->appearFar > obj->appearNear) {
                     if (dist < 0) dist = (int32_t)sqrtf((float)distSq);
@@ -640,7 +1039,7 @@ void Scene::prepareFrame() {
                 // distSq >= farSq: fully appeared, multiplier already 255.
             }
 
-            if (objAlpha == 0) continue;
+            if (objAlpha == 0) return;
         }
 
         // 1c) Global LOD pick. The head Object IS LOD 0; entries in
@@ -668,16 +1067,78 @@ void Scene::prepareFrame() {
                 }
                 // else: no LOD chain at all, draw the head as-is.
             } else {
-                continue; // ran out of LODs and not persisting → cull.
+                return; // ran out of LODs and not persisting → cull.
             }
         }
 
         // 2) Transform + project + per-triangle cull, push into renderQueue
+        if (obj->ignoreZBuffer || obj->noWriteZBuffer) sawBands = true;
+#if JET_PROFILE_PREP
+        const uint32_t robT = jetPrepNowUs();
+#endif
         renderObject(obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ, objAlpha, meshSource);
+#if JET_PROFILE_PREP
+        lastFramePrepObjectUs += jetPrepNowUs() - robT;
+#endif
         ++drawnObjs;
+    };
+
+    // TWO DRIVERS, ONE BODY. Without a tree this is registration order and
+    // the depth bucket sort below does all of the work. With one, the objects
+    // arrive already in a correct back-to-front order BETWEEN leaves, and
+    // groupQueueStart records where each leaf's triangles begin - so the depth
+    // key is only ever asked to settle the handful of objects inside one leaf,
+    // which is the one job it was ever good at.
+    groupQueueStart.clear();
+    const bool useTree = (sortTree != nullptr) && !sortTree->empty();
+    if (useTree) {
+        JetSubtreeCull cull;
+        constexpr float invFps = 1.0f / (float)FIXED_POINT_SCALE;
+        cull.camX = (float)camera->position.x;
+        cull.camY = (float)camera->position.y;
+        cull.camZ = (float)camera->position.z;
+        cull.cYc  = (float)camCosY * invFps; cull.cYs = (float)camSinY * invFps;
+        cull.cXc  = (float)camCosX * invFps; cull.cXs = (float)camSinX * invFps;
+        cull.cZc  = (float)camCosZ * invFps; cull.cZs = (float)camSinZ * invFps;
+        cull.fovFactor = camera->fovFactor;
+        cull.hw = (float)screenWidth * 0.5f;
+        cull.hh = (float)screenHeight * 0.5f;
+        cull.planeLh = cullPlaneLh;
+        cull.planeLv = cullPlaneLv;
+        cull.nearPlane = (float)camera->nearPlane;
+        cull.farPlane  = (float)camera->farPlane;
+        sortTree->order(camera->position.x, camera->position.y, camera->position.z,
+                        sortOrder, sortGroups, &jetSubtreeReject, &cull);
+        const int nObj = static_cast<int>(objects.size());
+        size_t g = 0;
+        for (size_t k = 0; k < sortOrder.size(); ++k) {
+            while (g < sortGroups.size() && sortGroups[g] == static_cast<int32_t>(k)) {
+                groupQueueStart.push_back(static_cast<int32_t>(renderQueue.size()));
+                ++g;
+            }
+            const int32_t oi = sortOrder[k];
+            if (oi >= 0 && oi < nObj) drawOne(objects[oi]);
+        }
+        // Anything registered AFTER the tree was built is not in it. Draw it
+        // last, in its own group: last is the only safe place for an object
+        // whose position the tree never saw.
+        //
+        // Against coveredCount() and NOT against sortOrder.size(), which is now
+        // shorter than the object list whenever the subtree cull fires - taking
+        // the difference for "new objects" would redraw whatever the cull just
+        // rejected, at the front of the frame, every frame.
+        const int covered = sortTree->coveredCount();
+        if (covered < nObj) {
+            groupQueueStart.push_back(static_cast<int32_t>(renderQueue.size()));
+            for (int i = covered; i < nObj; ++i) drawOne(objects[i]);
+        }
+        groupQueueStart.push_back(static_cast<int32_t>(renderQueue.size()));
+    } else {
+        for (auto obj : objects) drawOne(obj);
     }
     lastFrameDrawnObjects   = drawnObjs;
     lastFrameDrawnTriangles = static_cast<int>(renderQueue.size());
+    JET_PREP_SPLIT(lastFramePrepTransformUs, prepT);
 
     // 3) Global painter's sort. Three bands:
     //      0. noWriteZBuffer  — drawn first, so later geometry paints over
@@ -703,6 +1164,38 @@ void Scene::prepareFrame() {
     // the RenderTri structs themselves — the queue entries stay where
     // push_back left them and rasterizeBand() draws via renderOrder. This
     // deletes what used to be a full second copy of the queue every frame.
+    // PER-LEAF DEPTH SORT. The tree has already ordered the leaves against
+    // each other and that order is exact, so all that is left is the old key,
+    // run inside one leaf at a time. That is where zBias belongs and always
+    // did: the coplanar stack of road, slab and kerb inside a single block.
+    // Sorting a few dozen triangles at a time is CHEAPER than the 256-bucket
+    // counting sort it replaces, because it never has to touch the whole queue
+    // - no histogram, no prefix sums, no scatter.
+    if (useTree && !sawBands) {
+        const int N = static_cast<int>(renderQueue.size());
+        renderOrder.resize(N);
+        for (int i = 0; i < N; ++i) renderOrder[i] = i;
+        for (size_t g = 0; g + 1 < groupQueueStart.size(); ++g) {
+            const int32_t a = groupQueueStart[g], b = groupQueueStart[g + 1];
+            if (b - a < 2) continue;
+            // std::sort AND NOT std::stable_sort, with the queue index as the
+            // tie-break so the result is stable anyway. libstdc++'s
+            // stable_sort takes a temporary buffer from the heap on EVERY
+            // call, and this calls it once per leaf - a hundred small mallocs
+            // a frame on a console whose internal heap is the scarce resource.
+            // Breaking ties on the index costs one compare and keeps the
+            // emission order of equal-depth triangles, which is what the
+            // stability was ever for.
+            std::sort(renderOrder.begin() + a, renderOrder.begin() + b,
+                      [this](int32_t l, int32_t r) {
+                const RenderTri& tl = renderQueue[l];
+                const RenderTri& tr = renderQueue[r];
+                const int32_t kl = tl.sortZ - static_cast<int32_t>(tl.zBias) * 256;
+                const int32_t kr = tr.sortZ - static_cast<int32_t>(tr.zBias) * 256;
+                return (kl != kr) ? (kl > kr) : (l < r);
+            });
+        }
+    } else
     {
         const int N = static_cast<int>(renderQueue.size());
         renderOrder.resize(N);
@@ -710,14 +1203,30 @@ void Scene::prepareFrame() {
             const int32_t nearZ  = camera->nearPlane;
             const int32_t farZ   = camera->farPlane;
             const int32_t zRange = (farZ > nearZ) ? (farZ - nearZ) : 1;
-            constexpr int K = 64;
+            // PATCHED FOR arcade-os jet60: 64 -> 256.
+            //
+            // K buckets spread linearly across the whole near-to-far range, so at a
+            // 183 m far plane K=64 is 2.9 m per bucket and everything inside one is
+            // ordered by insertion, not depth. That is coarser than a building is
+            // wide, which is why an overpass pillar standing against a facade could
+            // not be ordered against it - the z-fighting that survived turning the
+            // decals off.
+            //
+            // K=256 was TRIED AND REVERTED ONCE (see tools/patch_jet_sort.py): at 72 cm
+            // a road chunk and the lane dash built into the same object separated, and
+            // the road painted over the dash. That caller no longer exists here - the
+            // lane markings and the helipad H are off on this branch, being the other
+            // half of the same z-fighting - so the constraint that pinned K to 64 is
+            // gone with them. The sort is O(N+K) and costs ~0.6 ms, so the extra
+            // buckets are close to free.
+            constexpr int K = 256;
             int counts[K] = {};
             int band0N = 0, band2N = 0;
             // Pass 1: classify bands; histogram the normal band by depth.
             for (const auto& t : renderQueue) {
                 if (t.noWriteZBuffer) { band0N++; continue; }
                 if (t.ignoreZBuffer)  { band2N++; continue; }
-                const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * zBiasScale;
+                const int32_t key = t.sortZ - static_cast<int32_t>(t.zBias) * zBiasScale;
                 int b = static_cast<int>((static_cast<int64_t>(key - nearZ) * K) / zRange);
                 if (b < 0) b = 0; else if (b >= K) b = K - 1;
                 ++counts[b];
@@ -733,7 +1242,7 @@ void Scene::prepareFrame() {
                 const RenderTri& t = renderQueue[i];
                 if (t.noWriteZBuffer) { renderOrder[b0++] = i; continue; }
                 if (t.ignoreZBuffer)  { renderOrder[b2++] = i; continue; }
-                const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * zBiasScale;
+                const int32_t key = t.sortZ - static_cast<int32_t>(t.zBias) * zBiasScale;
                 int b = static_cast<int>((static_cast<int64_t>(key - nearZ) * K) / zRange);
                 if (b < 0) b = 0; else if (b >= K) b = K - 1;
                 renderOrder[pos[b]++] = i;
@@ -742,6 +1251,7 @@ void Scene::prepareFrame() {
             renderOrder[0] = 0;
         }
     }
+    JET_PREP_SPLIT(lastFramePrepSortUs, prepT);
 }  // end prepareFrame()
 
 void Scene::clearBand(int yMin, int yMax) {
@@ -751,20 +1261,33 @@ void Scene::clearBand(int yMin, int yMax) {
     clearBuffers();
 }
 
-void Scene::rasterizeBand(int yMin, int yMax) {
+void Scene::rasterizeBand(int yMin, int yMax, uint16_t* zBandBase) {
     // Create a thread-local copy of the rasteriser so each band worker has
     // its own yBandMin/yBandMax. Only framebuffer/zbuffer ptrs are shared;
     // writes go to non-overlapping y regions so there is no write race.
     Rasterizer bandRast = *renderer;
     bandRast.yBandMin = yMin;
     bandRast.yBandMax = yMax;
+#if Z_BUFFERING
+    if (zBandBase) bandRast.setZBuffer(zBandBase);
+#endif
 
     // 4) Flush. Count triangles that actually entered the rasterizer
     // (drawTriangle returned true). Triangles dropped by per-tri checks
     // inside drawTriangle (alpha=0, zero-area, near/far Z, degenerate
     // denom) return false and don't count toward the rasterized total.
     int rasterized = 0;
+    const bool haveSpans = (triYSpan.size() == renderQueue.size());
     for (const int32_t idx : renderOrder) {
+        // PATCHED FOR arcade-os jet60: a 4-byte band reject in front of the
+        // ~100-byte load below. Guarded on the span array being in step with
+        // the queue, so a frame built without it still renders - just slower.
+        if (haveSpans) {
+            const int32_t sp = triYSpan[idx];
+            const int32_t lo = (int32_t)(int16_t)(sp & 0xFFFF);
+            const int32_t hi = (int32_t)(int16_t)((sp >> 16) & 0xFFFF);
+            if (hi < yMin || lo >= yMax) continue;
+        }
         const RenderTri& t = renderQueue[idx];
 #if MAX_PICK_QUERIES > 0
         bandRast.currentPickObject        = t.sourceObject;
@@ -1077,6 +1600,24 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // Object::Vertex): only the fields the configured pipeline consumes
     // are carried, and the transform loop below writes every live field,
     // so no upfront copy of the source vertex array is needed at all.
+    // PATCHED FOR arcade-os jet60: the object's own camera-space depth, used as
+    // the painter key for convex meshes. Accumulated in the transform loop that
+    // is walking every vertex anyway, so it costs an add per vertex.
+
+    int64_t objZSum = 0;
+    int32_t objZCount = 0;
+    int32_t objXMin = INT32_MAX, objXMax = INT32_MIN;
+    int32_t objYMin = INT32_MAX, objYMax = INT32_MIN;
+    int32_t objZMin = INT32_MAX, objZMax = INT32_MIN;
+    // PATCHED FOR arcade-os jet60: how many vertices this frame transformed.
+    //
+    // `xf` tracks neither drawn objects nor drawn triangles - obj 161/tri 557
+    // cost 17.06 ms where obj 241/tri 763 cost 14.44 - because the loop below
+    // runs over the WHOLE mesh of every admitted object, however few of its
+    // triangles survive. So the quantity that sets prepareFrame is the one
+    // number the log never had. Two adds a frame.
+    lastFrameTransformedVertices += (int)meshSource->vertices.size();
+
     static std::vector<RenderVertex> transformedVertices;
     static std::vector<Vector3> camSpacePos;
     const size_t vertCount = meshSource->vertices.size();
@@ -1157,44 +1698,6 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         fObjM20=(float)objM20/FIXED_POINT_SCALE; fObjM21=(float)objM21/FIXED_POINT_SCALE; fObjM22=(float)objM22/FIXED_POINT_SCALE;
     }
 
-    // Composed camera rotation matrix (Rz * Rx * Ry, since the previous
-    // per-vertex code applied Y→X→Z). Same scheme as the object matrix.
-    // Computed per object render rather than once per scene because the
-    // call cost is negligible (~9 muls / 9 divs) compared to the per-
-    // vertex savings; hoisting to renderScene would shave nine muls per
-    // *object*, not per vertex.
-    int32_t camM00, camM01, camM02;
-    int32_t camM10, camM11, camM12;
-    int32_t camM20, camM21, camM22;
-    {
-        const int32_t cx = camCosX, sx = camSinX;
-        const int32_t cy = camCosY, sy = camSinY;
-        const int32_t cz = camCosZ, sz = camSinZ;
-        // K = Rx * Ry
-        const int32_t k00 = cy;
-        const int32_t k01 = 0;
-        const int32_t k02 = sy;
-        const int32_t k10 = (int32_t)((int64_t)sx * sy / FIXED_POINT_SCALE);
-        const int32_t k11 = cx;
-        const int32_t k12 = (int32_t)(-(int64_t)sx * cy / FIXED_POINT_SCALE);
-        const int32_t k20 = (int32_t)(-(int64_t)cx * sy / FIXED_POINT_SCALE);
-        const int32_t k21 = sx;
-        const int32_t k22 = (int32_t)((int64_t)cx * cy / FIXED_POINT_SCALE);
-        // M = Rz * K
-        camM00 = (int32_t)(((int64_t)cz * k00 - (int64_t)sz * k10) / FIXED_POINT_SCALE);
-        camM01 = (int32_t)(((int64_t)cz * k01 - (int64_t)sz * k11) / FIXED_POINT_SCALE);
-        camM02 = (int32_t)(((int64_t)cz * k02 - (int64_t)sz * k12) / FIXED_POINT_SCALE);
-        camM10 = (int32_t)(((int64_t)sz * k00 + (int64_t)cz * k10) / FIXED_POINT_SCALE);
-        camM11 = (int32_t)(((int64_t)sz * k01 + (int64_t)cz * k11) / FIXED_POINT_SCALE);
-        camM12 = (int32_t)(((int64_t)sz * k02 + (int64_t)cz * k12) / FIXED_POINT_SCALE);
-        camM20 = k20;
-        camM21 = k21;
-        camM22 = k22;
-    }
-    // Float camera matrix: pre-divided by FIXED_POINT_SCALE once per object.
-    const float fCamM00=(float)camM00/FIXED_POINT_SCALE, fCamM01=(float)camM01/FIXED_POINT_SCALE, fCamM02=(float)camM02/FIXED_POINT_SCALE;
-    const float fCamM10=(float)camM10/FIXED_POINT_SCALE, fCamM11=(float)camM11/FIXED_POINT_SCALE, fCamM12=(float)camM12/FIXED_POINT_SCALE;
-    const float fCamM20=(float)camM20/FIXED_POINT_SCALE, fCamM21=(float)camM21/FIXED_POINT_SCALE, fCamM22=(float)camM22/FIXED_POINT_SCALE;
 
     // Combined object→camera transform, composed ONCE per object:
     //   p_cam = Cam · (Obj·p + objPos − camPos) = (Cam·Obj)·p + Cam·(objPos − camPos)
@@ -1362,6 +1865,11 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         if (pos.z == 0) pos.z = 1; // avoid divide-by-zero
         // Record camera-space position (pre-projection) for near-plane clipping.
         camSpacePos[vi] = pos;
+        objZSum += (int64_t)pos.z;
+        ++objZCount;
+        if (pos.x < objXMin) objXMin = pos.x;  if (pos.x > objXMax) objXMax = pos.x;
+        if (pos.y < objYMin) objYMin = pos.y;  if (pos.y > objYMax) objYMax = pos.y;
+        if (pos.z < objZMin) objZMin = pos.z;  if (pos.z > objZMax) objZMax = pos.z;
         const float invZ = fovFactor / (float)pos.z;
         dst.position.x = (int32_t)(pos.x * invZ) + screenWidth / 2;
         dst.position.y = screenHeight / 2 - (int32_t)(pos.y * invZ);
@@ -1388,6 +1896,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
 
 #if SORT_TRIANGLES
     // Sort the triangles by depth
+    // PATCHED IN THE VENDORED COPY (ion-drift tools/sync_to_arcade.ps1).
+    // No braces on purpose: the std::sort below is one statement.
+    if (meshSource->sortOwnTriangles)
     std::sort(meshSource->triangles.begin(), meshSource->triangles.end(), [&](const Object::Triangle& a, const Object::Triangle& b) {
         const auto& v1 = transformedVertices[a.v1];
         const auto& v2 = transformedVertices[a.v2];
@@ -1535,6 +2046,29 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.zBias          = obj->zBias;
         rt.objAlpha       = objAlpha;
         rt.avgZ           = avgZ;
+        // ONE KEY PER OBJECT, BUT ONLY WHEN THE OBJECT IS COMPACT IN DEPTH.
+        //
+        // A convex mesh under backface culling cannot have two visible faces
+        // overlap, so its triangles may share a key - but a key describes a
+        // point, and a LONG object is not near a point. A kerb running the
+        // length of a block took its midpoint depth and drew over a taxi
+        // standing at its far end; the overpass deck had the same shape of
+        // problem before it was chunked.
+        //
+        // The test is the object's own camera-space extents: use the object
+        // key only while it is no deeper than it is wide or tall. That is
+        // scene-independent and it follows the CAMERA - a kerb seen across is
+        // compact in depth and sorts as one object, the same kerb seen along
+        // its length spans depth and falls back to per-triangle, which is
+        // exactly when each is right.
+        const int32_t objZExt = (objZCount > 0) ? (objZMax - objZMin) : 0;
+        const int32_t objXExt = (objZCount > 0) ? (objXMax - objXMin) : 0;
+        const int32_t objYExt = (objZCount > 0) ? (objYMax - objYMin) : 0;
+        const bool    objCompact = objZCount > 0 &&
+                                   objZExt <= (objXExt > objYExt ? objXExt : objYExt);
+        rt.sortZ      = (!meshSource->sortOwnTriangles && objCompact)
+                      ? (int32_t)(objZSum / objZCount)
+                      : avgZ;
 #if LIGHTING
         rt.brightnessPrecomputed = objectLocalLight;
 #endif
@@ -1543,6 +2077,17 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.sourceTriangleIndex = srcTriIdx;
 #endif
         renderQueue.push_back(rt);
+        // PATCHED FOR arcade-os jet60: record this triangle's screen y span so
+        // rasterizeBand() can reject it per band without loading its vertices.
+        {
+            const int32_t ya = rt.v1.position.y, yb = rt.v2.position.y, yc = rt.v3.position.y;
+            int32_t lo = ya < yb ? ya : yb; if (yc < lo) lo = yc;
+            int32_t hi = ya > yb ? ya : yb; if (yc > hi) hi = yc;
+            if (lo < -32768) lo = -32768; else if (lo > 32767) lo = 32767;
+            if (hi < -32768) hi = -32768; else if (hi > 32767) hi = 32767;
+            triYSpan.push_back((int32_t)((uint32_t)(uint16_t)(int16_t)lo
+                                       | ((uint32_t)(uint16_t)(int16_t)hi << 16)));
+        }
     };
 
     // Render triangles with backface culling and shading

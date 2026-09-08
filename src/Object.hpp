@@ -66,6 +66,19 @@ public:
     Vector3 boundingBoxMin = {0,0,0};   ///< Local-space AABB minimum (recomputed by calculateBoundingBox).
     Vector3 boundingBoxMax = {0,0,0};   ///< Local-space AABB maximum.
     Vector3 centreVolume = {0,0,0};     ///< Local-space AABB centre.
+    // PATCHED IN THE VENDORED COPY (ion-drift tools/sync_to_arcade.ps1).
+    /// Depth-sort this mesh's OWN triangles each frame. A convex solid under
+    /// backface culling does not need it - its visible faces cannot overlap -
+    /// but a multi-part mesh does, because the global bucket sort is stable
+    /// and its buckets are far coarser than one object.
+    bool sortOwnTriangles = true;
+
+    // PATCHED FOR arcade-os jet60 (OBJECT-LEVEL BSP, see Scene.hpp).
+    /// Excluded from the sort tree and located per frame by its centre
+    /// instead. Set it on anything that moves: the tree is built once from
+    /// world bounding boxes, so an object that changes position would
+    /// otherwise be ordered from where it was at boot.
+    bool sortDynamic = false;
 
     Vector3 rotation = {0,0,0};                                                 ///< Euler rotation in degrees.
     Vector3 position = {0,0,0};                                                 ///< World-space position.
