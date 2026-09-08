@@ -1251,8 +1251,46 @@ void Scene::prepareFrame() {
             renderOrder[0] = 0;
         }
     }
+    // PATCHED FOR arcade-os: bucket the order by band. See
+    // Scene::setBandBucketRows() for why this is worth a pass.
+    //
+    // Deliberately inside the sort's timing: it is ordering work, it is
+    // proportional to the queue, and hiding it in an unmeasured corner of
+    // prepareFrame() is how a cost stops being questioned.
+    bandBucketValid_ = false;
+    if (bandBucketRows_ > 0 && triYSpan.size() == renderQueue.size()) {
+        const int rows  = bandBucketRows_;
+        const int bands = (screenHeight + rows - 1) / rows;
+        if (static_cast<int>(bandBucket_.size()) != bands) bandBucket_.resize(bands);
+        // clear(), not assign or a fresh vector: capacity survives the frame
+        // and the steady state allocates nothing.
+        for (auto& v : bandBucket_) v.clear();
+
+        // IN renderOrder ORDER, which is what keeps each bucket sorted. A
+        // bucket is a subsequence of the painter's order, so a band draws its
+        // triangles in the same sequence the full walk would have.
+        for (const int32_t idx : renderOrder) {
+            const int32_t sp = triYSpan[idx];
+            int lo = static_cast<int32_t>(static_cast<int16_t>(sp & 0xFFFF));
+            int hi = static_cast<int32_t>(static_cast<int16_t>((sp >> 16) & 0xFFFF));
+            if (hi < 0 || lo >= screenHeight) continue;   // wholly off-screen
+            if (lo < 0) lo = 0;
+            if (hi >= screenHeight) hi = screenHeight - 1;
+            const int bHi = hi / rows;
+            for (int b = lo / rows; b <= bHi; ++b) bandBucket_[b].push_back(idx);
+        }
+        bandBucketValid_ = true;
+    }
+
     JET_PREP_SPLIT(lastFramePrepSortUs, prepT);
 }  // end prepareFrame()
+
+void Scene::setBandBucketRows(int rows) {
+    if (rows == bandBucketRows_) return;
+    bandBucketRows_  = (rows > 0) ? rows : 0;
+    bandBucketValid_ = false;
+    bandBucket_.clear();
+}
 
 void Scene::clearBand(int yMin, int yMax) {
     if (!renderer) return;
@@ -1277,8 +1315,23 @@ void Scene::rasterizeBand(int yMin, int yMax, uint16_t* zBandBase) {
     // inside drawTriangle (alpha=0, zero-area, near/far Z, degenerate
     // denom) return false and don't count toward the rasterized total.
     int rasterized = 0;
-    const bool haveSpans = (triYSpan.size() == renderQueue.size());
-    for (const int32_t idx : renderOrder) {
+    bool haveSpans = (triYSpan.size() == renderQueue.size());
+
+    // PATCHED FOR arcade-os: this band's own list, when prepareFrame() built
+    // one that lines up with this call. See Scene::setBandBucketRows(). The
+    // list is already filtered, so the per-triangle reject below is skipped
+    // with it - which is the entire point, that reject being a random read
+    // into PSRAM repeated once per band per queued triangle.
+    const std::vector<int32_t>* order = &renderOrder;
+    if (bandBucketValid_ && bandBucketRows_ > 0 &&
+        yMin >= 0 && (yMin % bandBucketRows_) == 0 &&
+        (yMax - yMin) == bandBucketRows_ &&
+        (yMin / bandBucketRows_) < static_cast<int>(bandBucket_.size())) {
+        order     = &bandBucket_[yMin / bandBucketRows_];
+        haveSpans = false;
+    }
+
+    for (const int32_t idx : *order) {
         // PATCHED FOR arcade-os jet60: a 4-byte band reject in front of the
         // ~100-byte load below. Guarded on the span array being in step with
         // the queue, so a frame built without it still renders - just slower.

@@ -273,6 +273,34 @@ public:
     ///        Scene's own.
     void rasterizeBand(int yMin, int yMax, uint16_t* zBandBase = nullptr);
 
+    /// @brief PATCHED FOR arcade-os: bucket the sorted render order by output
+    ///        band, so rasterizeBand() walks only the triangles that touch it.
+    ///
+    ///        WHAT THIS IS FOR. rasterizeBand() walks the WHOLE render order
+    ///        and rejects what is not in its rows. The reject is 4 bytes -
+    ///        triYSpan[idx] - but idx comes from the sorted order, so that read
+    ///        is random access into an array that on the ESP32-S3 console lives
+    ///        in PSRAM. Ten bands x every queued triangle is ten thousand
+    ///        scattered reads a frame, and it measured at ~430 us PER BAND:
+    ///        4.3 ms of a 22 ms band loop that has nothing to do with drawing.
+    ///
+    ///        Bucketing moves that to one pass in prepareFrame() - on the core
+    ///        that is transforming the NEXT frame, not the one holding the wire
+    ///        open - and leaves each band walking its own short, contiguous
+    ///        list. A triangle spanning three bands appears in three lists.
+    ///
+    ///        Order is preserved: the buckets are filled by walking
+    ///        renderOrder, so each band's list is a subsequence of the painter's
+    ///        order and draws in exactly the sequence it would have anyway.
+    ///
+    /// @param rows Band height in output rows, or 0 to switch bucketing off.
+    ///        rasterizeBand() uses a bucket only for a call that lines up with
+    ///        it exactly - yMin a multiple of `rows`, height equal to `rows` -
+    ///        and falls back to the full walk for anything else, so
+    ///        render()'s whole-screen call still works with this on.
+    void setBandBucketRows(int rows);
+    int  bandBucketRows() const { return bandBucketRows_; }
+
     /// @brief Clear only the rows [yMin, yMax) of the current framebuffer without
     ///        re-running the transform or sort pipeline. Use this for bands 1+ when the
     ///        render queue from the preceding prepareFrame() call is still valid.
@@ -458,6 +486,13 @@ private:
     //
     // Parallel to renderQueue: triYSpan[i] describes renderQueue[i].
     std::vector<int32_t> triYSpan;
+
+    // PATCHED FOR arcade-os. See setBandBucketRows(). bandBucket_[b] is the
+    // subsequence of renderOrder whose triangles touch band b; empty and
+    // unused when bucketing is off or the span array is out of step.
+    int                               bandBucketRows_  = 0;
+    bool                              bandBucketValid_ = false;
+    std::vector<std::vector<int32_t>> bandBucket_;
 
     Camera* camera;
     DirectionalLight* directionalLight;
