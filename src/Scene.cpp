@@ -1262,8 +1262,8 @@ void Scene::prepareFrame() {
         const int rows  = bandBucketRows_;
         const int bands = (screenHeight + rows - 1) / rows;
         if (static_cast<int>(bandBucket_.size()) != bands) bandBucket_.resize(bands);
-        // clear(), not assign or a fresh vector: capacity survives the frame
-        // and the steady state allocates nothing.
+        // clear(), not assign or a fresh vector: capacity survives the frame,
+        // so with reserveBandBuckets() done the steady state allocates nothing.
         for (auto& v : bandBucket_) v.clear();
 
         // IN renderOrder ORDER, which is what keeps each bucket sorted. A
@@ -1286,10 +1286,23 @@ void Scene::prepareFrame() {
 }  // end prepareFrame()
 
 void Scene::setBandBucketRows(int rows) {
-    if (rows == bandBucketRows_) return;
-    bandBucketRows_  = (rows > 0) ? rows : 0;
+    const int r = (rows > 0) ? rows : 0;
+    // Idempotent, and that matters: TrackScene::pairScenes() calls this on a
+    // Scene that may already have it, and throwing the buckets away would
+    // throw away the capacity reserveBandBuckets() placed in PSRAM.
+    if (r == bandBucketRows_ && (r == 0 || !bandBucket_.empty())) return;
+    bandBucketRows_  = r;
     bandBucketValid_ = false;
     bandBucket_.clear();
+    // Sized here rather than on the first prepareFrame, so the host has
+    // something to reserve against before a frame has run.
+    if (bandBucketRows_ > 0)
+        bandBucket_.resize((screenHeight + bandBucketRows_ - 1) / bandBucketRows_);
+}
+
+void Scene::reserveBandBuckets(int perBand) {
+    if (perBand <= 0) return;
+    for (auto& v : bandBucket_) v.reserve(static_cast<size_t>(perBand));
 }
 
 void Scene::clearBand(int yMin, int yMax) {

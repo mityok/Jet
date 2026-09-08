@@ -301,6 +301,28 @@ public:
     void setBandBucketRows(int rows);
     int  bandBucketRows() const { return bandBucketRows_; }
 
+    /// @brief Give the buckets their capacity up front, from wherever the
+    ///        caller's allocator is currently pointing.
+    ///
+    ///        WHY THE CALLER HAS TO ASK. These are ordinary std::vectors, so
+    ///        they take whatever the platform allocator gives them - and on
+    ///        the ESP32-S3 console that is INTERNAL SRAM for anything under
+    ///        16 KB, which is the one resource the band pipeline has already
+    ///        spent (17 KB free once it is armed, in pieces of 7 KB). Ten
+    ///        buckets growing by doubling inside that is how a working build
+    ///        starts failing to allocate.
+    ///
+    ///        So the host reserves once, inside whatever scope sends large
+    ///        allocations to PSRAM, and the steady state then allocates
+    ///        nothing. A frame that overruns the reservation still works - the
+    ///        vector grows, wherever the allocator happens to point.
+    ///
+    /// @param perBand Entries to reserve per band. A triangle appears in one
+    ///        bucket per band it touches, so the sum across bands is the
+    ///        queue length times the band-crossing factor, not the queue
+    ///        length.
+    void reserveBandBuckets(int perBand);
+
     /// @brief Clear only the rows [yMin, yMax) of the current framebuffer without
     ///        re-running the transform or sort pipeline. Use this for bands 1+ when the
     ///        render queue from the preceding prepareFrame() call is still valid.
