@@ -38,10 +38,11 @@
 >   triangle sort's comparator dereferenced `transformedVertices` six times per
 >   comparison at scattered indices, and on this console that array is in PSRAM,
 >   so `std::sort` spent n log n cache misses per object per frame. Measured at
->   8.3 ms of a 27.4 ms transform. The key is now computed once per triangle in
->   one sequential pass and eight-byte {key, index} records are sorted, leaving
->   the mesh itself unpermuted - which also makes a triangle index mean the same
->   thing from one frame to the next. Same order out, ties in mesh order.
+>   8.3 ms of a 27.4 ms transform, and 3.7 ms after. The key is now computed
+>   once per triangle in one sequential pass and eight-byte {key, index}
+>   records are sorted, the permutation then applied to the mesh by cycles.
+>   Same order out. The permutation is not optional: ties inherit the order
+>   the previous frame's sort left, and dropping that changed the picture.
 > - **`Object::sortOwnTriangles`** - opt out of the per-frame sort of a mesh's own
 >   triangles. A convex solid under backface culling does not need it; it was
 >   7 ms of a 20.5 ms `prepareFrame()`.

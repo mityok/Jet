@@ -1916,18 +1916,28 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // comparator then touches nothing but the two records being compared, and
     // the sort moves 8 bytes where it used to move a 16-byte Triangle.
     //
-    // AND IT NO LONGER PERMUTES THE MESH. The old sort reordered
-    // meshSource->triangles in place, mutating shared geometry from inside
-    // what reads as a read-only transform. The queue loop below walks
-    // triOrder instead, so any index into a mesh's triangle list now means the
-    // same thing from one frame to the next - which is also what makes
-    // srcTriIdx a real triangle id for picking rather than this frame's slot.
+    // THE MESH IS STILL PERMUTED, AND THAT TURNED OUT TO MATTER. A first
+    // version left meshSource->triangles alone and had the queue loop walk
+    // triOrder instead - tidier, and it would have made a triangle index mean
+    // the same triangle from one frame to the next. It changed the picture.
     //
-    // The ORDER IS THE SAME ORDER. Same key, same expression, same int32
-    // arithmetic, same descending compare. The only difference is ties, which
-    // std::sort left arbitrary and which now come out in mesh order - the
-    // stable choice, and the one coplanar faces want, since the bucket sort
-    // downstream is itself stable.
+    // The reason is TIES, and what the old code did with them. Triangles at
+    // equal depth - a decal on the surface it sits on, two faces of a flat
+    // ribbon - compare equal, and std::sort leaves equal elements in an
+    // unspecified order. But it was sorting an array THIS SAME SORT HAD
+    // ORDERED LAST FRAME, so equals were already in a settled order and a
+    // nearly-sorted introsort mostly kept it. The tie order was therefore
+    // inherited from whenever those triangles last had distinguishable depths.
+    // Sorting a fresh index array threw that away every frame.
+    //
+    // So the permutation is applied back, by cycles, in place. Ties then break
+    // on the index into the ALREADY-SORTED array, which is last frame's order -
+    // the same hysteresis, now deterministic instead of a property of
+    // introsort's pivot choices. The cost is one record move per triangle
+    // against std::sort's n log n of them.
+    //
+    // Otherwise the ORDER IS THE SAME ORDER: same key, same expression, same
+    // int32 arithmetic, same descending compare.
     // ------------------------------------------------------------------
     struct TriDepthKey { int32_t key; uint32_t idx; };
     // Reused across objects and frames, like transformedVertices above and
@@ -1953,6 +1963,28 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
                       if (a.key != b.key) return a.key > b.key;
                       return a.idx < b.idx;
                   });
+
+        // Apply it, following cycles, with no scratch buffer: triOrder[d].idx
+        // is the slot destination d takes its triangle from, and bit 31 marks
+        // a slot already dealt with. Every element moves at most once.
+        const uint32_t DONE = 0x80000000u;
+        for (size_t start = 0; start < triCount; ++start) {
+            if (triOrder[start].idx & DONE) continue;
+            if ((size_t)triOrder[start].idx == start) {
+                triOrder[start].idx |= DONE;
+                continue;
+            }
+            Object::Triangle held = meshSource->triangles[start];
+            size_t dst = start;
+            for (;;) {
+                const size_t src = (size_t)(triOrder[dst].idx & ~DONE);
+                triOrder[dst].idx |= DONE;
+                if (src == start) break;
+                meshSource->triangles[dst] = meshSource->triangles[src];
+                dst = src;
+            }
+            meshSource->triangles[dst] = held;
+        }
     }
 #endif
 
@@ -2136,13 +2168,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         }
     };
 
-    // Render triangles with backface culling and shading.
-    // triOrder is the depth order built above, or empty when this object opted
-    // out of sorting its own triangles - in which case mesh order stands, as
-    // it always did.
-    const size_t triTotal = meshSource->triangles.size();
-    for (size_t k = 0; k < triTotal; ++k) {
-        const size_t triIdx = triOrder.empty() ? k : (size_t)triOrder[k].idx;
+    // Render triangles with backface culling and shading. Mesh order, which
+    // the block above has just made depth order.
+    for (size_t triIdx = 0; triIdx < meshSource->triangles.size(); ++triIdx) {
         const auto& triangle = meshSource->triangles[triIdx];
         const auto& vA = transformedVertices[triangle.v1];
         const auto& vB = transformedVertices[triangle.v2];
