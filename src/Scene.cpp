@@ -1894,20 +1894,66 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
 #endif
     }
 
+    // ------------------------------------------------------------------
+    // PATCHED FOR arcade-os: SORT A KEY, NOT THE MESH.
+    //
+    // This sort was 8.3 ms of a 27.4 ms transform, measured on the device by
+    // toggling sortOwnTriangles live in Ion Drift (33.7 ms of prepareFrame
+    // against 25.6 with it off, on a parked view of 814 drawn triangles). That
+    // is not the sort being algorithmically wrong - it is where its comparator
+    // reads from.
+    //
+    // The old comparator dereferenced transformedVertices SIX TIMES per
+    // comparison, at three effectively random indices per triangle. On this
+    // console that array is tens of kilobytes and lives in PSRAM, so every one
+    // of those was a likely cache miss, and std::sort does n log n of them: for
+    // one 360-triangle chunk that is ~3,000 comparisons and ~18,000 scattered
+    // PSRAM reads, per object, per frame.
+    //
+    // So compute the depth key ONCE per triangle - one sequential pass, three
+    // reads each, over vertices the transform loop above has only just
+    // written - and sort eight-byte {key, index} records instead. The
+    // comparator then touches nothing but the two records being compared, and
+    // the sort moves 8 bytes where it used to move a 16-byte Triangle.
+    //
+    // AND IT NO LONGER PERMUTES THE MESH. The old sort reordered
+    // meshSource->triangles in place, mutating shared geometry from inside
+    // what reads as a read-only transform. The queue loop below walks
+    // triOrder instead, so any index into a mesh's triangle list now means the
+    // same thing from one frame to the next - which is also what makes
+    // srcTriIdx a real triangle id for picking rather than this frame's slot.
+    //
+    // The ORDER IS THE SAME ORDER. Same key, same expression, same int32
+    // arithmetic, same descending compare. The only difference is ties, which
+    // std::sort left arbitrary and which now come out in mesh order - the
+    // stable choice, and the one coplanar faces want, since the bucket sort
+    // downstream is itself stable.
+    // ------------------------------------------------------------------
+    struct TriDepthKey { int32_t key; uint32_t idx; };
+    // Reused across objects and frames, like transformedVertices above and
+    // under the same assumption: one thread is inside prepareFrame() at a
+    // time. Under the two-Scene split that holds - core 0 transforms, core 1
+    // rasterises, and rasterizeBand() touches none of this.
+    static std::vector<TriDepthKey> triOrder;
+    triOrder.clear();
 #if SORT_TRIANGLES
-    // Sort the triangles by depth
     // PATCHED IN THE VENDORED COPY (ion-drift tools/sync_to_arcade.ps1).
-    // No braces on purpose: the std::sort below is one statement.
-    if (meshSource->sortOwnTriangles)
-    std::sort(meshSource->triangles.begin(), meshSource->triangles.end(), [&](const Object::Triangle& a, const Object::Triangle& b) {
-        const auto& v1 = transformedVertices[a.v1];
-        const auto& v2 = transformedVertices[a.v2];
-        const auto& v3 = transformedVertices[a.v3];
-        int32_t z1 = v1.position.z;
-        int32_t z2 = v2.position.z;
-        int32_t z3 = v3.position.z;
-        return (z1 + z2 + z3) / 3 > (transformedVertices[b.v1].position.z + transformedVertices[b.v2].position.z + transformedVertices[b.v3].position.z) / 3;
-    });
+    if (meshSource->sortOwnTriangles) {
+        const size_t triCount = meshSource->triangles.size();
+        triOrder.resize(triCount);
+        for (size_t i = 0; i < triCount; ++i) {
+            const Object::Triangle& t = meshSource->triangles[i];
+            triOrder[i].key = (transformedVertices[t.v1].position.z +
+                               transformedVertices[t.v2].position.z +
+                               transformedVertices[t.v3].position.z) / 3;
+            triOrder[i].idx = (uint32_t)i;
+        }
+        std::sort(triOrder.begin(), triOrder.end(),
+                  [](const TriDepthKey& a, const TriDepthKey& b) {
+                      if (a.key != b.key) return a.key > b.key;
+                      return a.idx < b.idx;
+                  });
+    }
 #endif
 
     // ------------------------------------------------------------------
@@ -2090,8 +2136,13 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         }
     };
 
-    // Render triangles with backface culling and shading
-    for (size_t triIdx = 0; triIdx < meshSource->triangles.size(); ++triIdx) {
+    // Render triangles with backface culling and shading.
+    // triOrder is the depth order built above, or empty when this object opted
+    // out of sorting its own triangles - in which case mesh order stands, as
+    // it always did.
+    const size_t triTotal = meshSource->triangles.size();
+    for (size_t k = 0; k < triTotal; ++k) {
+        const size_t triIdx = triOrder.empty() ? k : (size_t)triOrder[k].idx;
         const auto& triangle = meshSource->triangles[triIdx];
         const auto& vA = transformedVertices[triangle.v1];
         const auto& vB = transformedVertices[triangle.v2];

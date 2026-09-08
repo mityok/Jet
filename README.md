@@ -34,6 +34,14 @@
 > - **A 4-byte per-band triangle reject** (`Scene.cpp`) - `rasterizeBand()` walked
 >   the whole queue for every band and loaded a ~100-byte record to discover the
 >   triangle was elsewhere. A packed y-span read first makes the reject cheap.
+> - **A depth key sorted instead of the mesh** (`Scene.cpp`) - the per-object
+>   triangle sort's comparator dereferenced `transformedVertices` six times per
+>   comparison at scattered indices, and on this console that array is in PSRAM,
+>   so `std::sort` spent n log n cache misses per object per frame. Measured at
+>   8.3 ms of a 27.4 ms transform. The key is now computed once per triangle in
+>   one sequential pass and eight-byte {key, index} records are sorted, leaving
+>   the mesh itself unpermuted - which also makes a triangle index mean the same
+>   thing from one frame to the next. Same order out, ties in mesh order.
 > - **`Object::sortOwnTriangles`** - opt out of the per-frame sort of a mesh's own
 >   triangles. A convex solid under backface culling does not need it; it was
 >   7 ms of a 20.5 ms `prepareFrame()`.
