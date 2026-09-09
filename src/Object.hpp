@@ -132,6 +132,32 @@ public:
     bool sortDynamic = false;
 
     Vector3 rotation = {0,0,0};                                                 ///< Euler rotation in degrees.
+
+    /// @brief PATCHED FOR arcade-os: model-to-world rotation as nine floats,
+    ///        row-major, REPLACING `rotation` entirely when non-null.
+    ///
+    ///        WHY. `rotation` is an Euler triple in degrees composed as
+    ///        Rz·Ry·Rx about world axes, so an orientation that needs a roll
+    ///        about the model's OWN nose axis cannot be written down in it -
+    ///        Rz arrives last and about the wrong axis, which makes a banking
+    ///        craft pitch up or drop a wingtip depending on its heading.
+    ///
+    ///        Ion Drift worked around that by baking the roll into the mesh:
+    ///        every hull vertex of every craft rewritten every frame. Measured
+    ///        on the console, that was 2.81 ms a frame - eight craft at 240
+    ///        unshared vertices each, ~1,900 writes into PSRAM - against the
+    ///        nine floats it takes to say the same thing here.
+    ///
+    ///        A POINTER, NOT NINE FLOATS INLINE, because this struct is walked
+    ///        per frame per object and on this console the headers are in
+    ///        PSRAM: Taxi Rush has 488 of them and paying 36 bytes each to
+    ///        page in would cost more than it saves. The caller owns the
+    ///        storage and must keep it alive while the object is enabled.
+    ///
+    ///        Degrees also quantise: an Euler pose is rounded to whole degrees
+    ///        before the trig lookup, and a matrix is not, so this path is
+    ///        slightly more exact as well as very much cheaper.
+    const float* rotationMatrix = nullptr;
     Vector3 position = {0,0,0};                                                 ///< World-space position.
     Vector3 scale = {FIXED_POINT_SCALE, FIXED_POINT_SCALE, FIXED_POINT_SCALE};  ///< Per-axis scale (FIXED_POINT_SCALE = 1.0).
 

@@ -1711,8 +1711,12 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // constant for every vertex on the object. Also short-circuit the entire
     // rotation block when the object has zero rotation (true for most static
     // scenery), saving 12 mul + 6 div + 9 add per vertex.
+    // PATCHED FOR arcade-os: a caller-supplied matrix counts as a rotation
+    // even when the Euler triple is all zeroes, which for a craft flying
+    // straight and level it will be.
     const bool objHasRotation = !isBillboard &&
-        (obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0);
+        (obj->rotationMatrix != nullptr ||
+         obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0);
 
     // Composed object rotation matrix (Rz * Ry * Rx, since the previous
     // per-vertex code applied X→Y→Z). Storing all 9 entries at
@@ -1732,7 +1736,15 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     float fObjM00=1.0f, fObjM01=0.0f, fObjM02=0.0f;
     float fObjM10=0.0f, fObjM11=1.0f, fObjM12=0.0f;
     float fObjM20=0.0f, fObjM21=0.0f, fObjM22=1.0f;
-    if (objHasRotation) {
+    if (objHasRotation && obj->rotationMatrix) {
+        // PATCHED FOR arcade-os. Straight through: the caller has already
+        // composed the model-to-world rotation and Object::rotation is not
+        // consulted at all. See Object::rotationMatrix for what this is for.
+        const float* m = obj->rotationMatrix;
+        fObjM00 = m[0]; fObjM01 = m[1]; fObjM02 = m[2];
+        fObjM10 = m[3]; fObjM11 = m[4]; fObjM12 = m[5];
+        fObjM20 = m[6]; fObjM21 = m[7]; fObjM22 = m[8];
+    } else if (objHasRotation) {
         const int32_t cx = lookupCosI(obj->rotation.x);
         const int32_t sx = lookupSinI(obj->rotation.x);
         const int32_t cy = lookupCosI(obj->rotation.y);
