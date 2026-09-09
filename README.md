@@ -46,6 +46,27 @@
 > - **`Object::sortOwnTriangles`** - opt out of the per-frame sort of a mesh's own
 >   triangles. A convex solid under backface culling does not need it; it was
 >   7 ms of a 20.5 ms `prepareFrame()`.
+> - **Per-band buckets for the render order** (`Scene.cpp`, `setBandBucketRows`)
+>   - `rasterizeBand()` walked the WHOLE order for every band and rejected what
+>   was not in its rows. The reject is four bytes, but the index comes from the
+>   sorted order, so it is a random read into an array that lives in PSRAM on
+>   this console: ten bands times every queued triangle. Fitted at 430 us a
+>   band - 4.3 ms of a 22 ms band loop with no drawing in it. `prepareFrame()`
+>   now buckets the order once, on the core that is not holding the wire open.
+> - **`Object::Vertex` compiled down to 16 bytes from 36** - `RenderVertex` has
+>   always dropped `uv`, `normal` and `lambertBrightness` on `TEXTURE_MAPPING`
+>   and `LIGHTING`; the struct the transform loop actually WALKS never did.
+>   Measured across four views, `prepareFrame()` is linear in vertices and not
+>   triangles - `xfm = 1.30 ms + 3.45 us x vertices` - so the stride is the
+>   cost. A `(position, uv, normal)` constructor keeps upstream's seventy
+>   aggregate initialisers compiling unchanged.
+> - **`Object::rotationMatrix`** - a caller-owned model-to-world rotation that
+>   replaces `rotation` when non-null. An Euler triple composed Rz*Ry*Rx about
+>   WORLD axes cannot express a roll about the model's own nose axis, so Ion
+>   Drift was baking roll into the mesh: every hull vertex of every craft
+>   rewritten every frame, 2.81 ms. Nine floats say the same thing. A pointer
+>   rather than nine floats inline, because 488 object headers in PSRAM is
+>   already 5.5 ms of cull before any geometry.
 > - **`Object::sortDynamic`** - exclude a moving object from the sort tree, which
 >   is built from world bounding boxes and would otherwise order it from where
 >   it stood at boot.
