@@ -67,7 +67,9 @@ namespace Renderer
 
         for (auto& vert : vertices) {
             rotXYZ(vert.position);
+#if LIGHTING
             rotXYZ(vert.normal);
+#endif
         }
 
         rotation.assign(0, 0, 0);
@@ -144,9 +146,17 @@ namespace Renderer
             const int32_t fy = (int32_t)(ny * s);
             const int32_t fz = (int32_t)(nz * s);
 
+#if LIGHTING
             a.normal.x = fx; a.normal.y = fy; a.normal.z = fz;
             b.normal.x = fx; b.normal.y = fy; b.normal.z = fz;
             c.normal.x = fx; c.normal.y = fy; c.normal.z = fz;
+#else
+            // There are no normals to write to. The cross product above still
+            // runs and the optimiser discards it; kept whole rather than
+            // #if'd out around the arithmetic so the function stays readable
+            // and stays under review.
+            (void)fx; (void)fy; (void)fz; (void)a; (void)b; (void)c;
+#endif
         }
     }
 
@@ -240,6 +250,7 @@ namespace Renderer
             // Compute brightness from the face normal (v1 for FLAT/GOURAUD).
             // Use the same squared-falloff Lambert as jetShadeBrightness.
             uint32_t brightness = 0;
+#if LIGHTING
             if (directionalLight) {
                 const Vector3& N = vertices[tri.v1].normal;
                 const Vector3& L = directionalLight->worldLightDir;
@@ -254,6 +265,14 @@ namespace Renderer
                     if (brightness > maxBrightness) brightness = maxBrightness;
                 }
             }
+#else
+            // NO NORMALS IN THE BUILD, SO NO DIRECTIONAL TERM. A LIGHTING-off
+            // build bakes the ambient part only - which is the same picture the
+            // rasteriser would draw, since with LIGHTING off it does not shade
+            // anything either. Neither Ion Drift nor Taxi Rush calls this; both
+            // intern flat UNLIT materials instead.
+            (void)directionalLight;
+#endif
 
             // Per-channel modulation (mirrors jetModulateRGB565 in Renderer.cpp).
             const uint16_t base = tri.material->color;

@@ -24,7 +24,11 @@ namespace Primitives
                  n.y * FIXED_POINT_SCALE / length,
                  n.z * FIXED_POINT_SCALE / length);
 
+#if LIGHTING
         v1.normal.assign(n.x, n.y, n.z);
+#else
+        (void)v1;
+#endif
     }
 
     Object *createCube(int32_t width, int32_t height, int32_t depth, Material *material)

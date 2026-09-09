@@ -44,10 +44,31 @@ public:
     };
 
     /// @brief Single mesh vertex.
+    ///
+    /// PATCHED FOR arcade-os: uv AND normal ARE COMPILED OUT WHEN NOTHING
+    /// READS THEM, which is the rule RenderVertex has always followed
+    /// (Renderer.hpp) and which this struct never got.
+    ///
+    /// It is not about the bytes in isolation - it is the STRIDE. The
+    /// per-object transform loop is most of prepareFrame(), and measured on an
+    /// ESP32-S3 with the mesh in PSRAM it costs 3.45 us per vertex - about 830
+    /// cycles, far more arithmetic than a transform and a projection contain.
+    /// It is walking an array of 36-byte records to read 12 bytes out of each.
+    /// With TEXTURE_MAPPING and LIGHTING both off - the configuration a
+    /// flat-shaded, painter-sorted console build runs - uv, normal and
+    /// lambertBrightness are 22 of those 36 bytes and nothing reads any of them.
+    ///
+    /// Every site that touches a compiled-out field is guarded to match, so
+    /// turning either switch back on restores the field and its uses together.
+    /// Getting that wrong is a compile error, not a silent one.
     struct Vertex {
         Vector3 position = {0,0,0}; ///< World-local position.
+#if TEXTURE_MAPPING
         Vector2 uv = {0,0};         ///< Texture coordinates.
+#endif
+#if LIGHTING
         Vector3 normal = {0,0,0};   ///< Normal vector.
+#endif
         uint16_t color = 0x0000;    ///< Per-vertex colour (RGB565).
         /// @brief Precomputed Lambert+ambient-clipped brightness in
         /// [0..255+specular]. Populated by Scene.cpp ONLY for objects
@@ -56,7 +77,37 @@ public:
         /// cached value and re-computing from `normal` + `lightDir`.
         /// Skipping the per-vertex view-space normal transform is the
         /// whole point of the precompute path.
+#if LIGHTING
         uint16_t lambertBrightness = 0;
+#endif
+
+        Vertex() = default;
+
+        /// @brief PATCHED FOR arcade-os: position, uv, normal - in that order,
+        ///        whether or not the last two are compiled in.
+        ///
+        ///        Primitives.cpp and ObjLoader build seventy vertices as
+        ///        {{x,y,z}, {u,v}, {nx,ny,nz}}, which is aggregate
+        ///        initialisation and stops compiling the moment a member goes
+        ///        behind an #if. A constructor keeps every one of those call
+        ///        sites exactly as upstream wrote them, and drops the arguments
+        ///        this configuration has no field for.
+        Vertex(const Vector3& p, const Vector2& t, const Vector3& n)
+            : position(p)
+#if TEXTURE_MAPPING
+            , uv(t)
+#endif
+#if LIGHTING
+            , normal(n)
+#endif
+        {
+#if !TEXTURE_MAPPING
+            (void)t;
+#endif
+#if !LIGHTING
+            (void)n;
+#endif
+        }
     };
 
     std::vector<Vertex> vertices;       ///< Mesh vertices.

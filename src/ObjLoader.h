@@ -243,10 +243,14 @@ using namespace Renderer;
                         (int32_t)(tempVertices[(v - 1) * 3 + 1] * SCALE),
                         (int32_t)(tempVertices[(v - 1) * 3 + 2] * SCALE)
                     };
+#if TEXTURE_MAPPING
                     vert.uv = {
                         (int32_t)(tempUVs[(t - 1) * 2] * FIXED_POINT_SCALE),
                         (int32_t)(tempUVs[(t - 1) * 2 + 1] * FIXED_POINT_SCALE)
                     };
+#else
+                    (void)t;
+#endif
                     // Lighting needs per-vertex normals in fixed-point with
                     // magnitude FIXED_POINT_SCALE. Without this assignment
                     // every imported model lit only by ambient (Lambert's
@@ -254,6 +258,7 @@ using namespace Renderer;
                     // which is why ship faces never changed colour with
                     // orientation regardless of how the directional light
                     // was configured.
+#if LIGHTING
                     if (n > 0 && (size_t)(n * 3) <= tempNormals.size()) {
                         vert.normal = {
                             (int32_t)(tempNormals[(n - 1) * 3]     * FIXED_POINT_SCALE),
@@ -261,6 +266,9 @@ using namespace Renderer;
                             (int32_t)(tempNormals[(n - 1) * 3 + 2] * FIXED_POINT_SCALE)
                         };
                     }
+#else
+                    (void)n;
+#endif
                     return vert;
                 };
 
